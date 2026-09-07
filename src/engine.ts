@@ -958,6 +958,86 @@ export class LcmContextEngine implements ContextEngine {
     return Math.floor(value);
   }
 
+  /**
+   * Resolve the host-observed, model-returned live token count from a
+   * compact()/maintain() params bag using a documented priority chain.
+   *
+   * Order (highest priority first; first non-`undefined` wins):
+   *   1. `runtimeContext.usage` / `lastCallUsage` / `promptCache.lastCallUsage`
+   *      (the actual prompt token count returned by the model on the last API
+   *      call — the authoritative baseline).
+   *   2. Caller-supplied `currentTokenCount` and legacy `currentTokenCount`.
+   *   3. Persisted compaction telemetry snapshot (`lastObservedPromptTokenCount`)
+   *      — only consulted when `includeTelemetry` is true, which is the
+   *      deferred-drain entry point that may not have a live runtimeContext.
+   *   4. `staleFallback` — a last-resort value LCM wrote into its own debt
+   *      row. When used, a warn log is emitted so the operator can see the
+   *      session needs a fresher baseline.
+   *
+   * Returned `source` is one of `"runtimeContext" | "caller" | "telemetry" |
+   * "staleFallback" | "none"`. Callers use it for both the priority-chain
+   * debug log and the staleness warning.
+   */
+  private async resolveLiveTokenCount(
+    params: {
+      runtimeContext?: Record<string, unknown>;
+      currentTokenCount?: number;
+      legacyParams?: Record<string, unknown>;
+    },
+    options: {
+      conversationId?: number;
+      includeTelemetry?: boolean;
+      staleFallback?: number;
+      subject: string;
+      sessionLabel: string;
+    },
+  ): Promise<{ value: number | undefined; source: "runtimeContext" | "caller" | "telemetry" | "staleFallback" | "none" }> {
+    const runtimePromptTokens = extractRuntimePromptTokenCount(
+      asRecord(params.runtimeContext),
+    );
+    if (runtimePromptTokens !== undefined) {
+      this.deps.log.debug(
+        `[lcm] ${options.subject}: using runtime prompt token count${options.conversationId !== undefined ? ` conversation=${options.conversationId}` : ""} ${options.sessionLabel} currentTokenCount=${runtimePromptTokens}`,
+      );
+      return { value: runtimePromptTokens, source: "runtimeContext" };
+    }
+
+    const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
+      params.currentTokenCount ??
+        (
+          (params.legacyParams ?? {}) as {
+            currentTokenCount?: unknown;
+          }
+        ).currentTokenCount,
+    );
+    if (suppliedCurrentTokenCount !== undefined) {
+      return { value: suppliedCurrentTokenCount, source: "caller" };
+    }
+
+    if (options.includeTelemetry && options.conversationId !== undefined) {
+      const telemetry =
+        await this.compactionTelemetryStore.getConversationCompactionTelemetry(
+          options.conversationId,
+        );
+      const telemetryLastObserved = this.normalizeObservedTokenCount(
+        telemetry?.lastObservedPromptTokenCount ?? undefined,
+      );
+      if (telemetryLastObserved !== undefined) {
+        return { value: telemetryLastObserved, source: "telemetry" };
+      }
+    }
+
+    const staleFallback = this.normalizeObservedTokenCount(options.staleFallback);
+    if (staleFallback !== undefined) {
+      this.deps.log.warn(
+        `[lcm] ${options.subject}: using stale maintenance.currentTokenCount${options.conversationId !== undefined ? ` conversation=${options.conversationId}` : ""} ${options.sessionLabel} currentTokenCount=${staleFallback} — neither runtimeContext nor telemetry carried a fresher prompt token count; the host should pass runtimeContext.usage or call updateCompactionTelemetry so future drains have a fresh baseline`,
+      );
+      return { value: staleFallback, source: "staleFallback" };
+    }
+
+    return { value: undefined, source: "none" };
+  }
+
   /** Resolve token budget from direct params or legacy fallback input. */
   private resolveTokenBudget(params: {
     tokenBudget?: number;
@@ -1367,8 +1447,29 @@ export class LcmContextEngine implements ContextEngine {
           ? Math.min(params.tokenBudget, recordedTokenBudget)
           : params.tokenBudget,
       );
-      const resolvedCurrentTokenCount = this.normalizeObservedTokenCount(
-        params.currentTokenCount ?? maintenance.currentTokenCount ?? undefined,
+      // Resolve the host-observed, model-returned live token count using the
+      // four-tier priority chain documented in
+      // openspec/changes/fix-compaction-live-tokens-from-model/spec.md:
+      //   1. runtimeContext.usage / lastCallUsage / promptCache.lastCallUsage
+      //   2. caller-supplied params.currentTokenCount
+      //   3. persisted compaction_telemetry.last_observed_prompt_token_count
+      //   4. maintenance.currentTokenCount (last-resort, log-only regression)
+      // This avoids the long-standing wedge where deferred compaction silently
+      // falls back to a stale LCM-internal counter while the host knows the
+      // actual prompt tokens from the model's last API response.
+      const { value: resolvedCurrentTokenCount } = await this.resolveLiveTokenCount(
+        {
+          runtimeContext: asRecord(params.runtimeContext),
+          currentTokenCount: params.currentTokenCount,
+          legacyParams: asRecord(params.legacyParams),
+        },
+        {
+          conversationId: params.conversationId,
+          includeTelemetry: true,
+          staleFallback: maintenance.currentTokenCount ?? undefined,
+          subject: "maintain",
+          sessionLabel,
+        },
       );
       const compactableCurrentTokenCount = hostOwnsPromptFraming(params.runtimeSettings)
         ? undefined
@@ -1979,13 +2080,24 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const conversationId = params.conversationId;
-    const observedTokens = this.normalizeObservedTokenCount(
-      params.currentTokenCount ??
-        (
-          lp as {
-            currentTokenCount?: unknown;
-          }
-        ).currentTokenCount,
+    // Resolve the host-observed, model-returned live token count using the
+    // priority chain documented in
+    // openspec/changes/fix-compaction-live-tokens-from-model/spec.md.
+    // resolveLiveTokenCount() returns the first available source in the
+    // chain: runtimeContext → caller → telemetry → stale fallback.
+    const { value: observedTokens } = await this.resolveLiveTokenCount(
+      {
+        runtimeContext: params.runtimeContext,
+        currentTokenCount: params.currentTokenCount,
+        legacyParams,
+      },
+      {
+        subject: "compact",
+        sessionLabel,
+        // Compact always arrives with a fresh runtimeContext or an explicit
+        // currentTokenCount; the deferred-drain telemetry fallback is
+        // unnecessary here and would only add an extra DB read per call.
+      },
     );
     const promptFramingOwnedByHost = hostOwnsPromptFraming(params.runtimeSettings);
     const compactableObservedTokens = promptFramingOwnedByHost ? undefined : observedTokens;
@@ -3924,30 +4036,32 @@ export class LcmContextEngine implements ContextEngine {
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
     });
-    const runtimePromptTokens = extractRuntimePromptTokenCount(asRecord(params.runtimeContext));
-    const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
-      params.currentTokenCount ??
-      (
-        (legacyParams ?? {}) as {
-          currentTokenCount?: unknown;
-        }
-      ).currentTokenCount,
-    );
-    const observedCurrentTokenCount = runtimePromptTokens ?? suppliedCurrentTokenCount;
-    const compactableObservedTokenCount = hostOwnsPromptFraming(params.runtimeSettings)
-      ? undefined
-      : observedCurrentTokenCount;
-    if (runtimePromptTokens !== undefined) {
-      this.deps.log.debug(
-        `[lcm] ${params.phase}: using runtime prompt token count currentTokenCount=${runtimePromptTokens}`,
-      );
-    }
     if (!conversation) {
       this.deps.log.debug(
         `[lcm] ${params.phase}: conversation lookup missed ${sessionLabel}`,
       );
       return undefined;
     }
+    const { value: observedCurrentTokenCount } = await this.resolveLiveTokenCount(
+      {
+        runtimeContext: params.runtimeContext,
+        currentTokenCount: params.currentTokenCount,
+        legacyParams,
+      },
+      {
+        conversationId: conversation.conversationId,
+        subject: params.phase,
+        sessionLabel,
+        // afterTurn drains may not have a fresh runtimeContext; consult
+        // telemetry as a fallback so we don't drift back to the stale
+        // recorded counter when the host skipped updating it.
+        includeTelemetry: true,
+        staleFallback: undefined,
+      },
+    );
+    const compactableObservedTokenCount = hostOwnsPromptFraming(params.runtimeSettings)
+      ? undefined
+      : observedCurrentTokenCount;
 
     const recordCompactionRetry = async (
       reason: string,
