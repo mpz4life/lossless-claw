@@ -1923,3 +1923,279 @@ describe("#639 Mode 2 deferred-compaction wedge (live context exceeds target, no
     expect(m?.retryAttempts ?? 0, "must not accumulate retry attempts on exhaustion").toBe(0);
   });
 });
+
+describe("compact() observedTokens priority (liveTokens from model, fix-compaction-live-tokens-from-model)", () => {
+  it("executeCompactionCore prefers runtimeContext.usage over maintenance.currentTokenCount", async () => {
+    const engine = createEngine();
+    const sessionId = "compact-runtime-context-usage-wins";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    // Seed a stale maintenance.currentTokenCount that would mislead the old code path.
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation!.conversationId,
+      reason: "threshold",
+      tokenBudget: 128_000,
+      currentTokenCount: 120_000,
+    });
+
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 88_235,
+      threshold: 64_000,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: true,
+      tokensBefore: 88_235,
+      tokensAfter: 50_000,
+      condensed: false,
+    });
+    const debugSpy = vi.spyOn(
+      (engine as unknown as { deps: { log: { debug: ReturnType<typeof vi.fn> } } }).deps.log,
+      "debug",
+    );
+
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("compact-runtime-context-usage-wins"),
+      tokenBudget: 128_000,
+      force: true,
+      runtimeContext: {
+        usage: { input: 80_000, cacheRead: 5_000, cacheWrite: 3_235 },
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    // The host-observed, model-returned value (sum of usage parts) MUST be the
+      // observedTokens argument — not the stale maintenance counter.
+    expect(evaluateSpy).toHaveBeenCalledWith(
+      expect.any(Number),
+      128_000,
+      88_235,
+      expect.objectContaining({ contextThreshold: 0.75 }),
+    );
+    expect(
+      debugSpy.mock.calls.some((call) =>
+        String(call[0] ?? "").includes(
+          "[lcm] compact: using runtime prompt token count",
+        ) && String(call[0] ?? "").includes("currentTokenCount=88235"),
+      ),
+    ).toBe(true);
+  });
+
+  it("executeCompactionCore prefers runtimeContext.promptCache.lastCallUsage when top-level usage is absent", async () => {
+    const engine = createEngine();
+    const sessionId = "compact-prompt-cache-wins";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 76_000,
+      threshold: 64_000,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: true,
+      tokensBefore: 76_000,
+      tokensAfter: 50_000,
+      condensed: false,
+    });
+
+    await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("compact-prompt-cache-wins"),
+      tokenBudget: 128_000,
+      force: true,
+      runtimeContext: {
+        promptCache: {
+          lastCallUsage: { input: 70_000, cacheRead: 4_000, cacheWrite: 2_000 },
+        },
+      },
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(
+      expect.any(Number),
+      128_000,
+      76_000,
+      expect.objectContaining({ contextThreshold: 0.75 }),
+    );
+  });
+
+  it("executeCompactionCore caller-supplied currentTokenCount wins over runtimeContext.usage (caller override)", async () => {
+    const engine = createEngine();
+    const sessionId = "compact-caller-beats-runtime-context";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 65_000,
+      threshold: 64_000,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: true,
+      tokensBefore: 65_000,
+      tokensAfter: 50_000,
+      condensed: false,
+    });
+
+    await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("compact-caller-beats-runtime-context"),
+      tokenBudget: 128_000,
+      currentTokenCount: 65_000, // caller-supplied override
+      force: true,
+      runtimeContext: {
+        usage: { input: 80_000, cacheRead: 5_000, cacheWrite: 3_235 }, // sum 88_235 — would win if caller didn't override
+      },
+    });
+
+    // Caller override wins over runtimeContext-derived value. This matches the
+    // fallback-chain analysis: `params.currentTokenCount` is the caller's
+    // explicit intent and sits at priority 1, ahead of the model-returned
+    // runtime value at priority 2.
+    expect(evaluateSpy).toHaveBeenCalledWith(
+      expect.any(Number),
+      128_000,
+      65_000,
+      expect.objectContaining({ contextThreshold: 0.75 }),
+    );
+  });
+
+  it("executeCompactionCore falls back to params.currentTokenCount when runtimeContext has no usage", async () => {
+    const engine = createEngine();
+    const sessionId = "compact-caller-fallback";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 65_000,
+      threshold: 64_000,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: true,
+      tokensBefore: 65_000,
+      tokensAfter: 50_000,
+      condensed: false,
+    });
+
+    await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("compact-caller-fallback"),
+      tokenBudget: 128_000,
+      currentTokenCount: 65_000,
+      force: true,
+      // runtimeContext intentionally has no usage / lastCallUsage / promptCache shape.
+      runtimeContext: { provider: "anthropic", model: "claude-opus-4-5" },
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(
+      expect.any(Number),
+      128_000,
+      65_000,
+      expect.objectContaining({ contextThreshold: 0.75 }),
+    );
+  });
+
+  it("executeCompactionCore with no observation proceeds with stored-only counts (no garbage default)", async () => {
+    const engine = createEngine();
+    const sessionId = "compact-no-observation";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 5_000,
+      threshold: 4_000,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: true,
+      tokensBefore: 5_000,
+      tokensAfter: 3_000,
+      condensed: false,
+    });
+
+    await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("compact-no-observation"),
+      tokenBudget: 128_000,
+      force: true,
+      // No runtimeContext, no currentTokenCount, no legacyParams.
+    });
+
+    // observedTokens SHALL be undefined — no garbage fallback to e.g. 0 or to a stale row.
+    expect(evaluateSpy).toHaveBeenCalledWith(
+      expect.any(Number),
+      128_000,
+      undefined,
+      expect.objectContaining({ contextThreshold: 0.75 }),
+    );
+  });
+});

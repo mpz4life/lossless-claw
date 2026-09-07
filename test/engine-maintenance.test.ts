@@ -2737,3 +2737,285 @@ describe("applyScopedDoctorRepair backup safety", () => {
     }
   });
 });
+
+describe("consumeDeferredCompactionDebt liveTokens priority (fix-compaction-live-tokens-from-model)", () => {
+  it("prefers runtimeContext.usage over telemetry and stale maintenance.currentTokenCount", async () => {
+    const engine = createEngine();
+    const sessionId = "maintain-runtime-context-wins";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey: undefined });
+
+    // Seed telemetry with a real observed value AND seed a stale maintenance
+    // counter — the runtimeContext value MUST beat both.
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "hot",
+      consecutiveColdObservations: 0,
+      retention: "long",
+      lastObservedPromptTokenCount: 88_235,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 128_000,
+      currentTokenCount: 120_000,
+    });
+
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const executeSpy = vi
+      .spyOn(privateEngine, "executeCompactionCore")
+      .mockResolvedValue({ ok: true, compacted: true, reason: "compacted" });
+
+    await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-runtime-context-wins"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 128_000,
+        usage: { input: 80_000, cacheRead: 5_000, cacheWrite: 3_235 },
+      },
+    });
+
+    expect(executeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: conversation.conversationId,
+        tokenBudget: 128_000,
+        // Model-returned value (88_235) MUST be the resolved currentTokenCount.
+        currentTokenCount: 88_235,
+        compactionTarget: "threshold",
+      }),
+    );
+  });
+
+  it("falls back to telemetry when runtimeContext has no usage record", async () => {
+    const engine = createEngine();
+    const sessionId = "maintain-telemetry-fallback";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey: undefined });
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "cold",
+      consecutiveColdObservations: 1,
+      retention: "short",
+      lastObservedPromptTokenCount: 88_235,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 128_000,
+      currentTokenCount: 120_000,
+    });
+
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const executeSpy = vi
+      .spyOn(privateEngine, "executeCompactionCore")
+      .mockResolvedValue({ ok: true, compacted: true, reason: "compacted" });
+
+    await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-telemetry-fallback"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 128_000,
+        // No usage / lastCallUsage / promptCache shape.
+      },
+    });
+
+    expect(executeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        currentTokenCount: 88_235, // from telemetry, NOT the stale 120_000.
+      }),
+    );
+  });
+
+  it("uses maintenance.currentTokenCount as last resort and emits a warn log", async () => {
+    const engine = createEngine();
+    const sessionId = "maintain-stale-counter-only";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey: undefined });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 128_000,
+      currentTokenCount: 120_000,
+    });
+
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const executeSpy = vi
+      .spyOn(privateEngine, "executeCompactionCore")
+      .mockResolvedValue({ ok: true, compacted: true, reason: "compacted" });
+
+    const warnSpy = vi.spyOn(
+      (engine as unknown as { deps: { log: { warn: ReturnType<typeof vi.fn> } } }).deps.log,
+      "warn",
+    );
+
+    await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-stale-counter-only"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 128_000,
+      },
+    });
+
+    expect(executeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        currentTokenCount: 120_000, // last-resort fallback to stale counter.
+      }),
+    );
+    expect(
+      warnSpy.mock.calls.some((call) =>
+        String(call[0] ?? "").includes(
+          "using stale maintenance.currentTokenCount",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("uses runtimeContext.currentTokenCount when supplied and no usage record is present", async () => {
+    const engine = createEngine();
+    const sessionId = "maintain-runtime-context-current-token-count";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey: undefined });
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "hot",
+      consecutiveColdObservations: 0,
+      retention: "long",
+      lastObservedPromptTokenCount: 88_235,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 128_000,
+      currentTokenCount: 120_000,
+    });
+
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const executeSpy = vi
+      .spyOn(privateEngine, "executeCompactionCore")
+      .mockResolvedValue({ ok: true, compacted: true, reason: "compacted" });
+
+    // Caller puts currentTokenCount inside runtimeContext (because the
+    // maintain() entry point reads it from runtimeContext.currentTokenCount,
+    // matching the contract used by OpenClaw for compact()/maintain()).
+    // runtimeContext has no usage shape, so the chain is:
+    //   runtimeContext.usage (absent) → caller currentTokenCount (65_000)
+    //   → telemetry (88_235, ignored because caller wins) → maintenance counter.
+    await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-runtime-context-current-token-count"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 128_000,
+        currentTokenCount: 65_000,
+      },
+    });
+
+    expect(executeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        currentTokenCount: 65_000,
+      }),
+    );
+  });
+
+  it("emits the maintain debug log when runtimeContext.usage is selected", async () => {
+    const engine = createEngine();
+    const sessionId = "maintain-debug-log-runtime-wins";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey: undefined });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 128_000,
+      currentTokenCount: 120_000,
+    });
+
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    vi.spyOn(privateEngine, "executeCompactionCore").mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+    const debugSpy = vi.spyOn(
+      (engine as unknown as { deps: { log: { debug: ReturnType<typeof vi.fn> } } }).deps.log,
+      "debug",
+    );
+
+    await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-debug-log-runtime-wins"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 128_000,
+        usage: { input: 80_000, cacheRead: 5_000, cacheWrite: 3_235 },
+      },
+    });
+
+    expect(
+      debugSpy.mock.calls.some((call) =>
+        String(call[0] ?? "").includes(
+          "[lcm] maintain: using runtime prompt token count",
+        ) && String(call[0] ?? "").includes("currentTokenCount=88235"),
+      ),
+    ).toBe(true);
+  });
+
+  it("proceeds with undefined resolvedCurrentTokenCount when no observation is available", async () => {
+    const engine = createEngine();
+    const sessionId = "maintain-no-observation";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey: undefined });
+    // Seed threshold debt but DO NOT seed a maintenance counter and DO NOT
+    // pass runtimeContext. The drain must still run, with the helper
+    // reporting "no observation available" and executeCompactionCore seeing
+    // currentTokenCount === undefined (not a stale garbage default).
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 128_000,
+      // Intentionally omit currentTokenCount so the chain has nothing to fall
+      // back to. The helper must not invent a value.
+      currentTokenCount: null,
+    });
+
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const executeSpy = vi
+      .spyOn(privateEngine, "executeCompactionCore")
+      .mockResolvedValue({ ok: true, compacted: true, reason: "compacted" });
+
+    await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-no-observation"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 128_000,
+      },
+    });
+
+    expect(executeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        currentTokenCount: undefined,
+      }),
+    );
+  });
+});
