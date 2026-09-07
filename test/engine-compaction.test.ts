@@ -2048,9 +2048,9 @@ describe("compact() observedTokens priority (liveTokens from model, fix-compacti
     );
   });
 
-  it("executeCompactionCore prefers runtimeContext.usage over params.currentTokenCount (model-returned wins)", async () => {
+  it("executeCompactionCore caller-supplied currentTokenCount wins over runtimeContext.usage (caller override)", async () => {
     const engine = createEngine();
-    const sessionId = "compact-runtime-context-beats-caller";
+    const sessionId = "compact-caller-beats-runtime-context";
     await engine.ingest({
       sessionId,
       message: { role: "user", content: "trigger" } as AgentMessage,
@@ -2069,33 +2069,35 @@ describe("compact() observedTokens priority (liveTokens from model, fix-compacti
     const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
       shouldCompact: true,
       reason: "threshold",
-      currentTokens: 88_235,
+      currentTokens: 65_000,
       threshold: 64_000,
     });
     vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
       actionTaken: true,
-      tokensBefore: 88_235,
+      tokensBefore: 65_000,
       tokensAfter: 50_000,
       condensed: false,
     });
 
     await engine.compact({
       sessionId,
-      sessionFile: createSessionFilePath("compact-runtime-context-beats-caller"),
+      sessionFile: createSessionFilePath("compact-caller-beats-runtime-context"),
       tokenBudget: 128_000,
-      currentTokenCount: 65_000, // caller-supplied
+      currentTokenCount: 65_000, // caller-supplied override
       force: true,
       runtimeContext: {
-        usage: { input: 80_000, cacheRead: 5_000, cacheWrite: 3_235 }, // sum 88_235
+        usage: { input: 80_000, cacheRead: 5_000, cacheWrite: 3_235 }, // sum 88_235 — would win if caller didn't override
       },
     });
 
-    // Model-returned value wins (this is the bug fix's whole point: the
-      // runtimeContext is the authoritative baseline, not the caller override).
+    // Caller override wins over runtimeContext-derived value. This matches the
+    // fallback-chain analysis: `params.currentTokenCount` is the caller's
+    // explicit intent and sits at priority 1, ahead of the model-returned
+    // runtime value at priority 2.
     expect(evaluateSpy).toHaveBeenCalledWith(
       expect.any(Number),
       128_000,
-      88_235,
+      65_000,
       expect.objectContaining({ contextThreshold: 0.75 }),
     );
   });

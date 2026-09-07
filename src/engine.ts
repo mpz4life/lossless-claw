@@ -963,10 +963,11 @@ export class LcmContextEngine implements ContextEngine {
    * compact()/maintain() params bag using a documented priority chain.
    *
    * Order (highest priority first; first non-`undefined` wins):
-   *   1. `runtimeContext.usage` / `lastCallUsage` / `promptCache.lastCallUsage`
+   *   1. Caller-supplied `currentTokenCount` and legacy `currentTokenCount`
+   *      — explicit caller override; always wins when present.
+   *   2. `runtimeContext.usage` / `lastCallUsage` / `promptCache.lastCallUsage`
    *      (the actual prompt token count returned by the model on the last API
-   *      call — the authoritative baseline).
-   *   2. Caller-supplied `currentTokenCount` and legacy `currentTokenCount`.
+   *      call — the authoritative baseline when the caller did not override).
    *   3. Persisted compaction telemetry snapshot (`lastObservedPromptTokenCount`)
    *      — only consulted when `includeTelemetry` is true, which is the
    *      deferred-drain entry point that may not have a live runtimeContext.
@@ -974,7 +975,7 @@ export class LcmContextEngine implements ContextEngine {
    *      row. When used, a warn log is emitted so the operator can see the
    *      session needs a fresher baseline.
    *
-   * Returned `source` is one of `"runtimeContext" | "caller" | "telemetry" |
+   * Returned `source` is one of `"caller" | "runtimeContext" | "telemetry" |
    * "staleFallback" | "none"`. Callers use it for both the priority-chain
    * debug log and the staleness warning.
    */
@@ -991,17 +992,7 @@ export class LcmContextEngine implements ContextEngine {
       subject: string;
       sessionLabel: string;
     },
-  ): Promise<{ value: number | undefined; source: "runtimeContext" | "caller" | "telemetry" | "staleFallback" | "none" }> {
-    const runtimePromptTokens = extractRuntimePromptTokenCount(
-      asRecord(params.runtimeContext),
-    );
-    if (runtimePromptTokens !== undefined) {
-      this.deps.log.debug(
-        `[lcm] ${options.subject}: using runtime prompt token count${options.conversationId !== undefined ? ` conversation=${options.conversationId}` : ""} ${options.sessionLabel} currentTokenCount=${runtimePromptTokens}`,
-      );
-      return { value: runtimePromptTokens, source: "runtimeContext" };
-    }
-
+  ): Promise<{ value: number | undefined; source: "caller" | "runtimeContext" | "telemetry" | "staleFallback" | "none" }> {
     const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
       params.currentTokenCount ??
         (
@@ -1012,6 +1003,16 @@ export class LcmContextEngine implements ContextEngine {
     );
     if (suppliedCurrentTokenCount !== undefined) {
       return { value: suppliedCurrentTokenCount, source: "caller" };
+    }
+
+    const runtimePromptTokens = extractRuntimePromptTokenCount(
+      asRecord(params.runtimeContext),
+    );
+    if (runtimePromptTokens !== undefined) {
+      this.deps.log.debug(
+        `[lcm] ${options.subject}: using runtime prompt token count${options.conversationId !== undefined ? ` conversation=${options.conversationId}` : ""} ${options.sessionLabel} currentTokenCount=${runtimePromptTokens}`,
+      );
+      return { value: runtimePromptTokens, source: "runtimeContext" };
     }
 
     if (options.includeTelemetry && options.conversationId !== undefined) {
