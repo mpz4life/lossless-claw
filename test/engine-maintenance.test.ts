@@ -594,6 +594,69 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(result.reason).toBe("circuit breaker open");
   });
 
+  it("maintain() clears threshold debt after a safe-watermark sweep that missed the ideal target", async () => {
+    // A sweep can reduce the stored backlog but never below the fixed runtime
+    // framing (anchors, tool schemas, fresh tail). When the projected prompt
+    // stays within budget, the verdict must clear the debt instead of pinning
+    // it with a long spend backoff.
+    const engine = createEngineWithConfig({ contextThreshold: 0.7 });
+    const sessionId = "maintain-safe-watermark-clears-debt";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 92_612,
+      currentTokenCount: 92_171,
+      contextThreshold: 0.7,
+      contextThresholdSource: "global",
+    });
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      storedTokens: 92_171,
+      currentTokens: 92_171,
+      threshold: 64_828,
+      observedTokens: 88_235,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: true,
+      tokensBefore: 92_171,
+      tokensAfter: 77_794,
+      condensed: false,
+    });
+
+    const maintenanceResult = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-safe-watermark-clears-debt-maintain"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 92_612,
+        currentTokenCount: 88_235,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+    expect(maintenance?.lastFailureSummary).toBeNull();
+    expect(maintenance?.nextAttemptAfter).toBeNull();
+    expect(maintenanceResult.changed).toBe(true);
+  });
+
   it("maintain() backs off deferred threshold debt after non-auth compaction failures", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-05-31T12:00:00.000Z"));

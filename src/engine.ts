@@ -2257,15 +2257,40 @@ export class LcmContextEngine implements ContextEngine {
       // still make progress there).
       const thresholdSweepTranscriptWedge =
         thresholdSweepExhaustedOverTarget && compactableObservedTokens !== undefined;
+      // Safe-watermark clearance: a threshold sweep that made real progress
+      // but cannot reach the ideal target is only a failure when the
+      // projected post-sweep prompt would exceed the token budget. Stored
+      // compaction cannot shrink fixed runtime framing (anchors, tool
+      // schemas, fresh tail), so an in-budget projection clears the sweep
+      // honestly. Pinning a debt here would degrade every subsequent
+      // assemble and deadlock the session behind the host's raw-transcript
+      // precheck. Requires an observed prompt token count so overhead inferred
+      // from estimator methodology gaps alone cannot wrongly clear a sweep;
+      // without one the strict verdict below stands.
+      const promptSafeAfterSweep =
+        isThresholdSweep &&
+        sweepResult.actionTaken &&
+        compactableObservedTokens !== undefined &&
+        projectedTokensAfterSweep !== undefined &&
+        projectedTokensAfterSweep <= tokenBudget;
+      if (thresholdSweepStillOverTarget) {
+        this.deps.log.info(
+          `[lcm] compact: verdict detail conversation=${conversationId} ${sessionLabel} idealTarget=${targetTokens} tokenBudget=${tokenBudget} tokensAfter=${sweepTokensAfter ?? "none"} observedTokens=${compactableObservedTokens ?? "none"} observedRuntimeOverhead=${observedRuntimeOverhead} projectedTokensAfter=${projectedTokensAfterSweep ?? "none"} promptSafeAfterSweep=${promptSafeAfterSweep}`,
+        );
+      }
       const sweepOk =
         !sweepResult.authFailure &&
-        (isUnderTargetAfterSweep || (sweepResult.actionTaken && !isThresholdSweep));
+        (isUnderTargetAfterSweep ||
+          promptSafeAfterSweep ||
+          (sweepResult.actionTaken && !isThresholdSweep));
       const sweepReason = sweepResult.authFailure
         ? (sweepResult.actionTaken
             ? "provider auth failure after partial compaction"
             : "provider auth failure")
         : thresholdSweepStillOverTarget
-          ? "compacted but still over target"
+          ? promptSafeAfterSweep
+            ? "compacted to safe watermark; ideal target deferred"
+            : "compacted but still over target"
         : sweepResult.actionTaken
           ? "compacted"
           : isUnderTargetAfterSweep
@@ -2281,7 +2306,7 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
       let spendBackoffOpened = false;
-      if (thresholdSweepStillOverTarget && !sweepResult.authFailure) {
+      if (thresholdSweepStillOverTarget && !promptSafeAfterSweep && !sweepResult.authFailure) {
         if (lastRoundMadeProgress) {
           // The attempt ended at a deadline while still reducing tokens.
           // Progress is persisted; the deferred drain or next attempt
